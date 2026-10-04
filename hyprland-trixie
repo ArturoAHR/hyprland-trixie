@@ -63,7 +63,8 @@ container() { # container <lib script> [args]: run it in the build image, as you
   for k in "${CONFIG_KEYS[@]}"; do envs+=(-e "$k=${!k}"); done
   podman image exists "$IMAGE" || die "no build image yet: run 'hyprland-trixie image' first"
   mkdir -p "$OPT_ROOT" "$CACHE_DIR"
-  podman run --rm "${tty[@]}" --userns=keep-id -e HOME="$HOME" "${envs[@]}" -v /etc/localtime:/etc/localtime:ro \
+  podman run --rm "${tty[@]}" --userns=keep-id -e HOME="$HOME" -e LANG=C.UTF-8 "${envs[@]}" \
+    -v /etc/localtime:/etc/localtime:ro \
     -v "$OPT_ROOT:$OPT_ROOT" -v "$CACHE_DIR:$CACHE_DIR" -v "$REPO:/work:ro" \
     -w "$CACHE_DIR" "$IMAGE" bash "/work/lib/$1" "${@:2}"
 }
@@ -308,7 +309,9 @@ list_app() {
     read_installed "$dir/$v"
     for c in "${!INST[@]}"; do is_module "$c" && mods+=("$c"); done
     size=$(du -sh "$dir/$v" 2>/dev/null | cut -f1)
-    cache=$(du -sh "$CACHE_DIR/build/$APP/$v" 2>/dev/null | cut -f1)
+    cache=
+    # only component folders count; an adopted version has nothing but the lock file
+    compgen -G "$CACHE_DIR/build/$APP/$v/*/" >/dev/null && cache=$(du -sh "$CACHE_DIR/build/$APP/$v" | cut -f1)
     line=$(printf '  %s %-9s %5s   build cache %5s' "$([[ $v == "$cur" ]] && echo '*' || echo ' ')" "$v" "$size" \
       "${cache:--}")
     if [[ ! -f $dir/$v/$REC/installed ]]; then line+="   not built by hyprland-trixie: '$ME adopt $v'"
