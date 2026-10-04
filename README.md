@@ -205,7 +205,11 @@ podman rmi hyprland-trixie
 libmuparser2v5 libpugixml1v5 libsdbus-c++2 libseat1 libtomlplusplus3t64 libxcb-errors0 libiniparser4
 ```
 
-apt marks them as installed by hand, so `autoremove` leaves them alone. If nothing else of yours uses them, remove them with `sudo apt remove` and that list; apt shows anything else that would go with them before it asks. On another system the set differs: each version's `share/hyprland-trixie/runtime-packages.txt` lists every package it needs, whether it was already installed or not.
+apt marks them as installed by hand, so `autoremove` leaves them alone. If nothing else of yours uses them, remove them with `sudo apt remove` and that list; apt shows anything else that would go with them before it asks. On another system the set differs: each version's `share/hyprland-trixie/runtime-packages.txt` lists every package it needs, whether it was already installed or not. apt's own log shows which ones it actually added on yours:
+
+```bash
+zgrep -h -A3 -- '--no-install-recommends --no-upgrade' /var/log/apt/history.log* | grep '^Install:'
+```
 
 ## How it works
 
