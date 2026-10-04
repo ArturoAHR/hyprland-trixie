@@ -1,0 +1,33 @@
+name: check
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly: notices when an upstream release breaks the resolver
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -x -s bash -S warning hyprland-trixie lib/*.sh apps/*.sh components/*.sh
+
+  resolver:
+    # Resolves the newest Hyprland and Quickshell in plain Debian 13, the way `pin` does in the build image.
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl jq pkgconf \
+            wayland-protocols libxkbcommon-dev libinput-dev libsdbus-c++-dev
+      - uses: actions/checkout@v4
+      - name: pin latest
+        env:
+          CACHE_DIR: /tmp/cache
+        run: |
+          git config --global --add safe.directory "$PWD"
+          bash lib/resolve.sh pin hyprland latest | tee /tmp/hyprland.env
+          bash lib/resolve.sh pin quickshell latest | tee /tmp/quickshell.env
+          grep -q '^hyprland=v' /tmp/hyprland.env
+          grep -q '^quickshell=v' /tmp/quickshell.env

@@ -1,0 +1,8 @@
+# Debian packages for the build image, installed after GCC (see Containerfile). One per line.
+# `hyprland-trixie pin` and `build` append what a new version turns out to need.
+jq                  # the resolver reads Hyprland's flake.lock
+apt-file            # finds which Debian package provides a missing library
+libiniparser-dev    # hyprtoolkit
+libicu-dev          # hyprlauncher
+libqalculate-dev    # hyprlauncher
+libpci-dev          # hyprsysteminfo

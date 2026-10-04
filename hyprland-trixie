@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# hyprland-trixie - build Hyprland and Quickshell for Debian 13 in a container, install each version in its own
+# folder under ~/.local/opt, and choose which version your session starts. Run without arguments for help.
+set -Eeuo pipefail
+REPO=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lib/common.sh
+source "$REPO/lib/common.sh"
+load_config
+load_components
+
+usage() {
+  local newest
+  newest=$(pinned_versions | tail -n1)
+  cat <<EOF
+Usage: hyprland-trixie [quickshell] <command> [arguments]
+
+Commands act on Hyprland; put "quickshell" first to act on Quickshell instead.
+
+  image                         build or update the build container
+  pin <version|latest>          work out the release of every component: writes pins/<app>/<version>.env
+  pin <version> --add <name...> pin components that version's file lacks
+  build <version> [module...]   build <version> with the modules in your config plus any named here
+  deps <version> [--install]    check the Debian packages <version> needs at runtime; --install adds missing ones
+  use <version>                 make <version> the one your next session starts, and link its programs
+  list                          installed versions, the current one, their modules and cache sizes
+  modules                       optional modules you can build in
+  remove <version> [module...]  delete a version, or only some modules from it
+  prune [<version>]             delete build caches: of <version>, or of every version not installed
+  adopt <version>               take over a build made by the earlier runbook scripts without rebuilding it
+  unlink                        undo \`use\`: remove the links and the current pointer, keep the versions
+  config                        create $USER_CONFIG to change preferences
+
+First run:  image, build ${newest:-<version>}, deps ${newest:-<version>} --install, use ${newest:-<version>},
+then start \`hyprland-session\` from a text console (Ctrl+Alt+F3).
+EOF
+}
+
+# ---------- helpers ----------
+pinned_versions() {
+  local f
+  for f in "$REPO/pins/$APP"/*.env; do [[ -e $f ]] && basename "$f" .env; done | sort -V
+}
+installed_versions() {
+  local d
+  for d in "$OPT_ROOT/$APP"/*/; do
+    d=${d%/}
+    [[ -L $d || ! -d $d ]] || basename "$d"
+  done | sort -V
+}
+current_version() { readlink "$OPT_ROOT/$APP/current" 2>/dev/null || true; }
+confirm() {
+  [[ -n ${YES:-} ]] && return 0
+  [[ -t 0 ]] || die "$1 Refusing without a terminal; set YES=1 to go ahead."
+  local a
+  read -rp "$1 [y/N] " a
+  [[ $a == [yY]* ]]
+}
+is_elf() { [[ -f $1 && $(od -An -tx1 -N4 "$1" 2>/dev/null) == ' 7f 45 4c 46' ]]; }
+
+container() { # container <lib script> [args]: run it in the build image, as you, with your folders mounted
+  local tty=() envs=() k
+  [[ -t 0 && -t 1 ]] && tty=(-it)
+  for k in "${CONFIG_KEYS[@]}"; do envs+=(-e "$k=${!k}"); done
+  podman image exists "$IMAGE" || die "no build image yet: run 'hyprland-trixie image' first"
+  mkdir -p "$OPT_ROOT" "$CACHE_DIR"
+  podman run --rm "${tty[@]}" --userns=keep-id -e HOME="$HOME" "${envs[@]}" -v /etc/localtime:/etc/localtime:ro \
+    -v "$OPT_ROOT:$OPT_ROOT" -v "$CACHE_DIR:$CACHE_DIR" -v "$REPO:/work:ro" \
+    -w "$CACHE_DIR" "$IMAGE" bash "/work/lib/$1" "${@:2}"
+}
+
+# Where a file from a build gets linked: bin/ into BIN_DIR, systemd user units and share/ into your XDG folders
+link_dest() {
+  case $1 in
+    bin/*) printf '%s/%s\n' "$BIN_DIR" "${1#bin/}" ;;
+    lib/systemd/user/*) printf '%s/systemd/user/%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}" "${1#lib/systemd/user/}" ;;
+    share/*) printf '%s/%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}" "${1#share/}" ;;
+    *) die "don't know where to link $1" ;;
+  esac
+}
+our_links() { # the symlinks `use` made: they point through $OPT_ROOT/$APP/current
+  local c rel d
+  for c in "${COMPONENTS[@]}"; do for rel in ${C_LINKS[$c]}; do dirname "$(link_dest "$rel")"; done; done | sort -u |
+    while IFS= read -r d; do
+      [[ -d $d ]] && find "$d" -maxdepth 1 -type l -lname "$OPT_ROOT/$APP/current/*"
+    done
+  return 0
+}
+run_hook() { # run_hook <component> <function>: run it if components/<component>.sh defines it
+  (
+    # shellcheck disable=SC1090
+    source "$REPO/components/$1.sh"
+    if declare -F "$2" >/dev/null; then "$2"; fi
+  )
+}
+relink() { # link what $CUR has; drop links into current that now point at nothing
+  local c rel dest l
+  read_installed "$CUR"
+  for c in "${!INST[@]}"; do
+    for rel in ${C_LINKS[$c]:-}; do
+      dest=$(link_dest "$rel")
+      if [[ ! -e $CUR/$rel ]]; then warn "$c: $rel isn't in this build; not linked"; continue; fi
+      if [[ -e $dest || -L $dest ]] && [[ $(readlink "$dest") != "$OPT_ROOT/$APP/current/"* ]]; then
+        warn "$dest exists and isn't a hyprland-trixie link; left alone"
+        continue
+      fi
+      mkdir -p "$(dirname "$dest")"
+      ln -sfn "$CUR/$rel" "$dest"
+    done
+  done
+  while IFS= read -r l; do
+    [[ -e $l ]] || { rm -f "$l"; say "Removed $l (not in this version)"; }
+  done < <(our_links)
+}
+
+to_build() { # to_build <version> [module...]: the components a build would compile, one per line
+  local v=$1 c order
+  shift
+  read_pins "$(pins_file "$APP" "$v")"
+  read_installed "$OPT_ROOT/$APP/$v"
+  # shellcheck disable=SC2086
+  order=$(build_order $APP_CORE "$@" "${!INST[@]}") || exit 1
+  for c in $order; do
+    [[ ${C_RESOLVE[$c]} == none || ${PIN[$c]:-} == system || ${INST[$c]:-} == "${PIN[$c]:-}" ]] ||
+      printf '%s\n' "$c"
+  done
+}
+
+ensure_packages() { # ensure_packages <version> <component...>: put what building those would miss into the image
+  local out kind a b c d line pkg
+  local -a names=() found=() add=() none=()
+  local -A why=()
+  (( $# > 1 )) || return 0
+  say "Checking the build image has what it takes to build: ${*:2}"
+  out=$(container resolve.sh check "$APP" "$@") || die "the check failed (above)"
+  while read -r kind a b c d; do
+    case $kind in
+      needs) warn "components/$a.sh should list $b in its needs" ;;
+      old) warn "Debian's $a is $b, and $d asks for >= $c; apt can't fix that, so the build may fail" ;;
+      missing) why[$a]+="${why[$a]:+, }$b" ;;
+    esac
+  done <<<"$out"
+  names=("${!why[@]}")
+  (( ${#names[@]} )) || { say "Nothing missing."; return 0; }
+  say "The image lacks: ${names[*]}. Asking Debian which packages provide them (downloads its file index)..."
+  # shellcheck disable=SC2016
+  mapfile -t found < <(podman run --rm "$IMAGE" bash -c '
+    { apt-get update -qq && apt-file update; } >/dev/null 2>&1 || exit 1
+    for n; do
+      p=$(apt-file search --regexp "/pkgconfig/${n//+/\\+}\.pc\$" | cut -d: -f1 | sort -u | head -n1)
+      echo "$n ${p:--}"
+    done' _ "${names[@]}")
+  for line in "${found[@]}"; do
+    read -r a pkg <<<"$line"
+    if [[ $pkg == - ]]; then none+=("$a")
+    elif ! grep -qE "^$pkg([[:space:]]|$)" "$REPO/packages.txt"; then
+      add+=("$pkg")
+      printf '%-19s # %s, for %s %s\n' "$pkg" "${why[$a]}" "$APP" "$1" >> "$REPO/packages.txt"
+    fi
+  done
+  (( ${#none[@]} )) && warn "no Debian 13 package provides ${none[*]}; if the build really needs it, it fails there"
+  (( ${#add[@]} )) || return 0
+  say "Added to packages.txt: ${add[*]}. Rebuilding the image (only its last layer)..."
+  cmd_image
+}
+
+# ---------- commands ----------
+cmd_image() { podman build -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"; }
+
+cmd_pin() {
+  local v=${1:-} out f ver c force=
+  [[ -n $v ]] || die "usage: pin <version|latest> [--force]   or   pin <version> --add <component...>"
+  shift
+  if [[ ${1:-} == --add ]]; then
+    shift
+    (( $# )) || die "pin $v --add: which components?"
+    f=$(pins_file "$APP" "$v")
+    [[ -f $f ]] || die "no $f yet: run '$ME pin $v' first"
+    for c; do [[ -n ${C_KIND[$c]:-} ]] || die "unknown component: $c"; done
+    out=$(container resolve.sh add "$APP" "$v" "$@")
+    [[ -z $out ]] || printf '%s\n' "$out" >> "$f"
+    say "Updated $f"
+    return 0
+  fi
+  [[ ${1:-} == --force ]] && force=1
+  out=$(container resolve.sh pin "$APP" "$v")
+  ver=$(sed -nE "s/^# Pins for $APP ([^,]+),.*/\1/p" <<<"$out")
+  [[ -n $ver ]] || die "the resolver printed no pins"
+  f=$(pins_file "$APP" "$ver")
+  if [[ -f $f && -z $force ]]; then
+    say "$f exists. A fresh resolve would change:"
+    diff "$f" - <<<"$out" | grep -E '^[<>] [^#]' || say "  nothing"
+    say "Run '$ME pin $ver --force' to replace it."
+    return 0
+  fi
+  mkdir -p "$(dirname "$f")"
+  printf '%s\n' "$out" > "$f"
+  say "Wrote $f"
+  local -a mods=() comps=()
+  [[ $APP == hyprland ]] && read -ra mods <<<"$MODULES"
+  mapfile -t comps < <(to_build "$ver" "${mods[@]}")
+  ensure_packages "$ver" "${comps[@]}"
+  say "Next: $ME build $ver"
+}
+
+cmd_build() {
+  local v=${1:-} f m c order
+  [[ -n $v ]] || die "usage: build <version> [module...]"
+  shift
+  f=$(pins_file "$APP" "$v")
+  [[ -f $f ]] || die "no pins for $APP $v: run '$ME pin $v' first"
+  local -a mods=() missing=() comps=()
+  [[ $APP == hyprland ]] && read -ra mods <<<"$MODULES"
+  mods+=("$@")
+  for m in "${mods[@]}"; do is_module "$m" || die "$m isn't a $APP module (see: $ME modules)"; done
+  # Pin what this version's file lacks: a module added to hyprland-trixie after the version was pinned
+  read_pins "$f"
+  # shellcheck disable=SC2086
+  order=$(build_order $APP_CORE "${mods[@]}") || exit 1
+  for c in $order; do [[ ${C_RESOLVE[$c]} == none || -n ${PIN[$c]:-} ]] || missing+=("$c"); done
+  if (( ${#missing[@]} )); then
+    say "Pinning ${missing[*]} for $APP $v"
+    cmd_pin "$v" --add "${missing[@]}"
+    read_pins "$f"
+  fi
+  for m in "${mods[@]}"; do [[ -n ${PIN[$m]:-} ]] || die "no release of $m fits $APP $v (see $f)"; done
+  mapfile -t comps < <(to_build "$v" "${mods[@]}")
+  (( ${#comps[@]} )) || say "Everything asked for is already in $APP $v."
+  ensure_packages "$v" "${comps[@]}"
+  container build.sh "$APP" "$v" "${mods[@]}"
+  if [[ $(current_version) == "$v" ]]; then
+    say "$v is current; refreshing its links"
+    cmd_use "$v"
+  else
+    say "Next: $ME deps $v --install, then $ME use $v"
+  fi
+}
+
+cmd_use() {
+  local v=${1:-} c dir=$OPT_ROOT/$APP
+  [[ -n $v ]] || die "usage: use <version>"
+  [[ -d $dir/$v && ! -L $dir/$v ]] || die "$APP $v isn't installed. Installed: $(installed_versions | tr '\n' ' ')"
+  [[ -f $dir/$v/$REC/installed ]] || die "$dir/$v wasn't built by hyprland-trixie: '$ME adopt $v' takes it over"
+  ln -sfn "$v" "$dir/current"
+  CUR=$dir/current
+  relink
+  for c in "${!INST[@]}"; do run_hook "$c" component_on_use; done
+  app_on_use
+  systemctl --user daemon-reload 2>/dev/null || true
+  say "$APP $v is current: your next session starts it."
+}
+
+cmd_unlink() {
+  local l c
+  CUR=$OPT_ROOT/$APP/current
+  while IFS= read -r l; do rm -v "$l"; done < <(our_links)
+  if [[ -L $CUR ]]; then
+    read_installed "$CUR"
+    for c in "${!INST[@]}"; do run_hook "$c" component_on_unlink; done
+    rm -v "$CUR"
+  fi
+  app_on_unlink
+  systemctl --user daemon-reload 2>/dev/null || true
+  say "Unlinked $APP. The versions in $OPT_ROOT/$APP stay; '$ME use <version>' links one again."
+}
+
+cmd_deps() {
+  local v=${1:-} install='' p list pkg f out st bad=0
+  [[ -n $v ]] || die "usage: deps <version> [--install]"
+  [[ ${2:-} == --install ]] && install=1
+  p=$OPT_ROOT/$APP/$v
+  list=$p/$REC/runtime-packages.txt
+  [[ -f $list ]] || die "no package list in $p: build or adopt it first"
+  local -a missing=()
+  while read -r pkg; do
+    [[ -n $pkg ]] || continue
+    # One status line per installed architecture (libc6 often has amd64 and i386); any "installed" will do
+    # shellcheck disable=SC2016
+    st=$(dpkg-query -W -f='${db:Status-Status}\n' "$pkg" 2>/dev/null || true)
+    [[ $'\n'$st$'\n' == *$'\ninstalled\n'* ]] || missing+=("$pkg")
+  done < "$list"
+  if (( ${#missing[@]} )); then
+    if [[ -z $install ]]; then
+      say "Missing: ${missing[*]}"
+      say "Install them with '$ME deps $v --install', which runs:"
+      say "  sudo apt install --no-install-recommends --no-upgrade ${missing[*]}"
+      return 1
+    fi
+    sudo apt-get install --no-install-recommends --no-upgrade "${missing[@]}"
+  fi
+  say "All $(grep -c . "$list") runtime packages are installed."
+  while IFS= read -r f; do
+    is_elf "$f" || continue
+    out=$(ldd -r "$f" 2>&1 | grep -E 'not found|undefined symbol' || true)
+    [[ -z $out ]] || { say "$f:"; say "$out"; bad=1; }
+  done < <(find "$p/bin" "$p/libexec" -maxdepth 1 -type f 2>/dev/null)
+  (( bad == 0 )) || return 1
+  say "Every program in $p resolves its libraries on this system."
+}
+
+list_app() {
+  local dir=$OPT_ROOT/$APP cur v c size cache line any=
+  local -a mods
+  cur=$(current_version)
+  say "$APP ($dir)"
+  while IFS= read -r v; do
+    any=1
+    mods=()
+    read_installed "$dir/$v"
+    for c in "${!INST[@]}"; do is_module "$c" && mods+=("$c"); done
+    size=$(du -sh "$dir/$v" 2>/dev/null | cut -f1)
+    cache=$(du -sh "$CACHE_DIR/build/$APP/$v" 2>/dev/null | cut -f1)
+    line=$(printf '  %s %-9s %5s   build cache %5s' "$([[ $v == "$cur" ]] && echo '*' || echo ' ')" "$v" "$size" \
+      "${cache:--}")
+    if [[ ! -f $dir/$v/$REC/installed ]]; then line+="   not built by hyprland-trixie: '$ME adopt $v'"
+    elif (( ${#mods[@]} )); then line+="   modules: $(printf '%s\n' "${mods[@]}" | sort | paste -sd' ')"
+    fi
+    say "$line"
+  done < <(installed_versions)
+  [[ -n $any ]] || say "    nothing installed"
+  for v in $(pinned_versions); do [[ -d $dir/$v ]] || say "    $v pinned, not built"; done
+  if [[ -d $CACHE_DIR/build/$APP ]]; then
+    for v in "$CACHE_DIR/build/$APP"/*/; do
+      v=$(basename "$v")
+      [[ -d $dir/$v ]] || say "    $v removed, build cache kept ($(du -sh "$CACHE_DIR/build/$APP/$v" | cut -f1))"
+    done
+  fi
+  return 0
+}
+cmd_list() {
+  if [[ -n $APP_EXPLICIT ]]; then list_app; else
+    local a
+    for a in "$REPO"/apps/*.sh; do load_app "$(basename "$a" .sh)"; list_app; echo; done
+    say "* = current, what your next session starts"
+  fi
+}
+
+cmd_modules() {
+  local c mark
+  [[ -n $(app_modules) ]] || { say "$APP has no optional modules."; return 0; }
+  say "Optional $APP modules. Build them into every version through MODULES in your config, or into one:"
+  say "  $ME build <version> <module>"
+  say ""
+  for c in $(app_modules); do
+    mark=
+    [[ " $MODULES " == *" $c "* ]] && mark="  [in MODULES]"
+    printf '  %-18s %s%s\n' "$c" "${C_DESC[$c]}" "$mark"
+  done
+}
+
+cmd_remove() {
+  local v=${1:-} p cur m f x
+  [[ -n $v ]] || die "usage: remove <version> [module...]"
+  shift
+  p=$OPT_ROOT/$APP/$v
+  [[ -d $p && ! -L $p ]] || die "$APP $v isn't installed"
+  cur=$(current_version)
+  if (( $# == 0 )); then
+    [[ $v != "$cur" ]] || die "$v is current: '$ME use <another version>' first, or '$ME unlink'"
+    confirm "Delete $p ($(du -sh "$p" | cut -f1))?" || return 1
+    rm -rf "$p"
+    say "Removed $p. Its build cache stays in $CACHE_DIR/build/$APP/$v; '$ME prune' clears it."
+    return 0
+  fi
+  read_installed "$p"
+  for m; do
+    is_module "$m" || die "$m isn't a $APP module"
+    [[ -n ${INST[$m]:-} ]] || die "$m isn't in $APP $v"
+    [[ -f $p/$REC/files/$m.txt ]] || die "there is no file list for $m (it was adopted, not built here)"
+  done
+  for m; do
+    f=$p/$REC/files/$m.txt
+    while IFS= read -r x || [[ -n $x ]]; do [[ $x == "$p/"* ]] && rm -f "$x"; done < "$f"
+    rm -f "$f"
+    sed -i "/^$m=/d" "$p/$REC/installed"
+    say "Removed $m from $APP $v"
+  done
+  find "$p" -mindepth 1 -type d -empty -delete
+  if [[ $v == "$cur" ]]; then cmd_use "$v"; fi
+}
+
+cmd_prune() {
+  local b=$CACHE_DIR/build/$APP v d s a keep
+  if [[ -n ${1:-} ]]; then
+    [[ -d $b/$1 ]] || die "no build cache for $APP $1"
+    say "Deleting $b/$1 ($(du -sh "$b/$1" | cut -f1)). $APP $1 itself stays; adding a module to it later"
+    say "still builds only that module."
+    rm -rf "${b:?}/$1" "$CACHE_DIR/logs/$APP/$1"
+    return 0
+  fi
+  for d in "$b"/*/; do
+    [[ -d $d ]] || continue
+    v=$(basename "$d")
+    [[ -d $OPT_ROOT/$APP/$v ]] && continue
+    say "Deleting the build cache of $APP $v ($(du -sh "$d" | cut -f1))"
+    rm -rf "$d" "$CACHE_DIR/logs/$APP/$v"
+  done
+  # sources that no installed version of any app was built from
+  keep=" "
+  for a in "$REPO"/apps/*.sh; do
+    a=$(basename "$a" .sh)
+    for d in "$OPT_ROOT/$a"/*/; do
+      [[ -f $d$REC/installed ]] || continue
+      read_kv "$d$REC/installed" INST
+      for s in "${!INST[@]}"; do keep+="$s-${INST[$s]} lua-${INST[$s]}.tar.gz "; done
+    done
+  done
+  for s in "$CACHE_DIR"/src/*; do
+    [[ -e $s ]] || continue
+    [[ $keep == *" $(basename "$s") "* ]] && continue
+    say "Deleting source $(basename "$s")"
+    rm -rf "$s"
+  done
+}
+
+cmd_adopt() {
+  local v=${1:-}
+  [[ -n $v ]] || die "usage: adopt <version>"
+  [[ -d $OPT_ROOT/$APP/$v ]] || die "nothing at $OPT_ROOT/$APP/$v"
+  [[ -f $(pins_file "$APP" "$v") ]] || die "no pins for $APP $v; adopting needs pins that match what was built"
+  container build.sh --adopt "$APP" "$v"
+  say "Next: $ME use $v (relinks it the way this tool does)"
+}
+
+cmd_config() {
+  if [[ -f $USER_CONFIG ]]; then say "$USER_CONFIG exists; edit it there."; return 0; fi
+  mkdir -p "$(dirname "$USER_CONFIG")"
+  {
+    printf '# hyprland-trixie settings. Uncomment what you want to change; the rest keeps the defaults.\n\n'
+    sed -E 's/^([A-Z_]+=)/# \1/' "$REPO/config.defaults.env"
+  } > "$USER_CONFIG"
+  say "Wrote $USER_CONFIG"
+}
+
+# ---------- main ----------
+APP=hyprland APP_EXPLICIT=
+case ${1:-} in
+  quickshell | qs) APP=quickshell APP_EXPLICIT=1; shift ;;
+  hyprland) APP_EXPLICIT=1; shift ;;
+esac
+load_app "$APP"
+ME=hyprland-trixie
+[[ $APP == hyprland ]] || ME+=" $APP"
+cmd=${1:-help}
+(( $# )) && shift
+case $cmd in
+  image) cmd_image ;;
+  pin) cmd_pin "$@" ;;
+  build) cmd_build "$@" ;;
+  deps) cmd_deps "$@" ;;
+  use) cmd_use "$@" ;;
+  list | ls) cmd_list ;;
+  modules) cmd_modules ;;
+  remove | rm) cmd_remove "$@" ;;
+  prune) cmd_prune "$@" ;;
+  adopt) cmd_adopt "$@" ;;
+  unlink) cmd_unlink ;;
+  config) cmd_config ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
