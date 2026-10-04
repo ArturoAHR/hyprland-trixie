@@ -199,7 +199,13 @@ rm -rf ~/.local/opt/hyprland ~/.local/opt/quickshell ~/.cache/hyprland-trixie
 podman rmi hyprland-trixie
 ```
 
-The runtime packages `deps --install` added are listed in each version's `share/hyprland-trixie/runtime-packages.txt`. apt marks them as installed by hand, so `autoremove` leaves them alone; remove any you don't otherwise need with `sudo apt remove`.
+`deps --install` installs only the runtime packages your system doesn't have yet. On the Debian 13 system with KDE Plasma 6 this was tested on, that came to seven small libraries for Hyprland 0.56.2 with `hyprland-guiutils`, and nothing more for Quickshell or the other modules:
+
+```
+libmuparser2v5 libpugixml1v5 libsdbus-c++2 libseat1 libtomlplusplus3t64 libxcb-errors0 libiniparser4
+```
+
+apt marks them as installed by hand, so `autoremove` leaves them alone. If nothing else of yours uses them, remove them with `sudo apt remove` and that list; apt shows anything else that would go with them before it asks. On another system the set differs: each version's `share/hyprland-trixie/runtime-packages.txt` lists every package it needs, whether it was already installed or not.
 
 ## How it works
 
